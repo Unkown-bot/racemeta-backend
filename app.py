@@ -50,6 +50,105 @@ def get_latest_race_session():
     data.sort(key=lambda x: x["date_end"])
     return data[-1]
 
+# Mapping from words in the question -> (country_name, track_hint)
+TRACK_KEYWORDS = {
+    # Italy
+    "monza": ("Italy", "Monza"),
+    "imola": ("Italy", "Imola"),
+
+    # UK
+    "silverstone": ("Great Britain", "Silverstone"),
+    "british gp": ("Great Britain", "Silverstone"),
+
+    # Belgium
+    "spa": ("Belgium", "Spa"),
+
+    # Netherlands
+    "zandvoort": ("Netherlands", "Zandvoort"),
+
+    # Austria
+    "red bull ring": ("Austria", "Red Bull Ring"),
+    "austria gp": ("Austria", "Red Bull Ring"),
+
+    # Hungary
+    "hungaroring": ("Hungary", "Hungaroring"),
+
+    # Spain
+    "barcelona": ("Spain", "Barcelona"),
+    "catalunya": ("Spain", "Barcelona"),
+
+    # Monaco
+    "monaco": ("Monaco", "Monaco"),
+
+    # Middle East / Asia
+    "bahrain": ("Bahrain", "Bahrain"),
+    "sakhir": ("Bahrain", "Sakhir"),
+    "jeddah": ("Saudi Arabia", "Jeddah"),
+    "saudi": ("Saudi Arabia", "Jeddah"),
+    "yas marina": ("Abu Dhabi", "Yas Marina"),
+    "abu dhabi": ("Abu Dhabi", "Yas Marina"),
+    "suzuka": ("Japan", "Suzuka"),
+    "qatar": ("Qatar", "Qatar"),
+    "losail": ("Qatar", "Losail"),
+
+    # Americas (all in USA/Canada/Brazil/Mexico)
+    "interlagos": ("Brazil", "Interlagos"),
+    "brazil": ("Brazil", "Interlagos"),   # rough but ok
+    "cota": ("USA", "Americas"),
+    "austin": ("USA", "Americas"),
+    "miami": ("USA", "Miami"),
+    "vegas": ("USA", "Vegas"),
+    "las vegas": ("USA", "Vegas"),
+    "montreal": ("Canada", "Montreal"),
+    "canadian gp": ("Canada", "Montreal"),
+    "mexico": ("Mexico", "Mexico"),
+
+    # Australia
+    "melbourne": ("Australia", "Melbourne"),
+    "albert park": ("Australia", "Albert Park"),
+}
+
+def choose_session_for_question(question: str):
+    """
+    Decide which race session to use based on the user's wording.
+
+    Priority:
+    1) If the question mentions a known track/GP keyword (e.g. 'Monza', 'Imola'),
+       pick the latest Race at that circuit within its country.
+    2) Otherwise, fall back to the absolute latest race (get_latest_race_session).
+    """
+    q = question.lower()
+
+    for keyword, (country_name, track_hint) in TRACK_KEYWORDS.items():
+        if keyword in q:
+            # Fetch all races in that country
+            params = {"session_type": "Race", "country_name": country_name}
+            resp = requests.get(f"{OPENF1_BASE}/sessions", params=params, timeout=10)
+            resp.raise_for_status()
+            sessions = resp.json()
+            if not sessions:
+                continue
+
+            track_hint_lower = track_hint.lower()
+
+            # Prefer sessions whose meeting/location/circuit names contain the track_hint
+            def has_track_hint(s):
+                text = " ".join([
+                    str(s.get("meeting_name", "")),
+                    str(s.get("location", "")),
+                    str(s.get("circuit_short_name", "")),
+                ]).lower()
+                return track_hint_lower in text
+
+            track_sessions = [s for s in sessions if has_track_hint(s)]
+
+            candidates = track_sessions or sessions
+            candidates.sort(key=lambda x: x["date_end"])
+            return candidates[-1]
+
+    # No track keyword matched -> global latest race
+    return get_latest_race_session()
+
 
 def get_stints(session_key: int, driver_number: int):
     params = {"session_key": session_key, "driver_number": driver_number}
@@ -173,6 +272,8 @@ def summarise_stints(stints, pit_lap: int):
             after_comp = comp
 
     return "\n".join(lines), before_comp, after_comp
+
+
 
 # -------- RACEMETA PROMPT --------
 
@@ -320,10 +421,11 @@ def analyze_latest():
         return jsonify({"error": f"Invalid payload: {e}"}), 400
 
     try:
-        # 1) Latest race
-        session = get_latest_race_session()
+        # 1) Choose race session based on question (track-aware)
+        session = choose_session_for_question(question)
         session_key = session["session_key"]
         meeting_key = session["meeting_key"]
+
 
         # 2) Detect driver
         driver_number = detect_driver_number_from_question(question, session_key)
