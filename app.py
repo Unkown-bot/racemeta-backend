@@ -148,7 +148,7 @@ def call_racemeta(context_block: str) -> str:
             {"role": "user", "content": context_block}
         ],
         temperature=0.4,
-        max_tokens=180,
+        max_completion_tokens=180,
     )
     return completion.choices[0].message.content.strip()
 
