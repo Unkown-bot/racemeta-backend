@@ -1,5 +1,6 @@
 import os
 import requests
+import re
 from flask import Flask, request, jsonify
 from openai import OpenAI
 
@@ -31,6 +32,21 @@ def get_race_session(year: int, country_name: str):
     data.sort(key=lambda x: x["date_end"])
     return data[-1]
 
+def get_latest_race_session():
+    """
+    Get the most recent completed Race session from OpenF1.
+    Used when the user just asks about 'Lewis' etc without specifying race.
+    """
+    params = {"session_type": "Race"}
+    resp = requests.get(f"{OPENF1_BASE}/sessions", params=params, timeout=10)
+    resp.raise_for_status()
+    data = resp.json()
+    if not data:
+        raise ValueError("No race sessions found in OpenF1.")
+    # sort by end date and take latest
+    data.sort(key=lambda x: x["date_end"])
+    return data[-1]
+
 
 def get_stints(session_key: int, driver_number: int):
     params = {"session_key": session_key, "driver_number": driver_number}
@@ -57,6 +73,80 @@ def get_driver_info(session_key: int, driver_number: int):
     if not data:
         return None
     return data[0]
+
+import re  # at top of file if not already imported
+
+def detect_driver_number_from_question(question: str, session_key: int):
+    """
+    Try to figure out which driver the user is talking about
+    based on the text, using OpenF1 driver list for that session.
+    """
+    q = question.lower()
+
+    # Fetch all drivers for this session
+    params = {"session_key": session_key}
+    resp = requests.get(f"{OPENF1_BASE}/drivers", params=params, timeout=10)
+    resp.raise_for_status()
+    drivers = resp.json()
+
+    # First, try to match by any of first/last/full/broadcast name appearing in the question
+    for d in drivers:
+        candidates = set()
+        if d.get("full_name"):
+            candidates.add(d["full_name"].lower())
+        if d.get("first_name"):
+            candidates.add(d["first_name"].lower())
+        if d.get("last_name"):
+            candidates.add(d["last_name"].lower())
+        if d.get("broadcast_name"):
+            candidates.add(d["broadcast_name"].lower())
+
+        for name in candidates:
+            if not name:
+                continue
+            # Simple containment check
+            if name in q:
+                return d["driver_number"]
+
+    # Fallback: some common short-name nicknames
+    # (this handles 'lewis', 'max', 'checo', 'lando' etc if above didn't catch)
+    nickname_map = {
+        "lewis": 44,
+        "hamilton": 44,
+        "max": 1,
+        "verstappen": 1,
+        "checo": 11,
+        "perez": 11,
+        "charles": 16,
+        "leclerc": 16,
+        "lando": 4,
+        "norris": 4,
+        "george": 63,
+        "russell": 63,
+        "carlos": 55,
+        "sainz": 55,
+    }
+
+    for nick, num in nickname_map.items():
+        if nick in q:
+            return num
+
+    return None
+
+def detect_lap_from_question(question: str):
+    """
+    Look for patterns like 'lap 16' in the question.
+    Returns an int lap number or None if not found.
+    """
+    q = question.lower()
+    match = re.search(r"lap\s+(\d+)", q)
+    if match:
+        try:
+            return int(match.group(1))
+        except ValueError:
+            return None
+    return None
+
 
 
 def summarise_stints(stints, pit_lap: int):
@@ -152,12 +242,15 @@ def call_racemeta(context_block: str) -> str:
     )
     return completion.choices[0].message.content.strip()
 
+
+
 # -------- HTTP ENDPOINT --------
 
 from flask import Flask, request, jsonify  # re-import to be safe
 
 @app.route("/analyze", methods=["POST"])
 def analyze():
+
     try:
         data = request.get_json(force=True)
         year = int(data["year"])
@@ -198,6 +291,85 @@ def analyze():
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+@app.route("/analyze_latest", methods=["POST"])
+def analyze_latest():
+    """
+    Natural-language endpoint.
+
+    Expects JSON:
+    {
+      "question": "Was it right to pit Lewis or extend his stint?"
+    }
+
+    Logic:
+    - Use latest race from OpenF1.
+    - Detect driver from question.
+    - Detect lap from question if present.
+    - If no lap, choose first pit stop (between stint 1 and 2).
+    - Reuse existing RaceMeta pipeline.
+    """
+    try:
+        data = request.get_json(force=True)
+        question = str(data["question"])
+    except Exception as e:
+        return jsonify({"error": f"Invalid payload: {e}"}), 400
+
+    try:
+        # 1) Latest race
+        session = get_latest_race_session()
+        session_key = session["session_key"]
+        meeting_key = session["meeting_key"]
+
+        # 2) Detect driver
+        driver_number = detect_driver_number_from_question(question, session_key)
+        if driver_number is None:
+            return jsonify({"error": "Could not detect driver from question for latest race."}), 400
+
+        # 3) Fetch stints for this driver
+        stints = get_stints(session_key, driver_number)
+        if not stints:
+            return jsonify({"error": "No stint data for this driver in latest race."}), 400
+
+        # 4) Detect lap from question, else infer first stop from stints
+        pit_lap = detect_lap_from_question(question)
+        stints_sorted = sorted(stints, key=lambda s: s["stint_number"])
+
+        if pit_lap is None:
+            if len(stints_sorted) > 1:
+                pit_lap = stints_sorted[1]["lap_start"] - 1
+            else:
+                pit_lap = (stints_sorted[0]["lap_start"] + stints_sorted[0]["lap_end"]) // 2
+
+        # 5) Driver + weather
+        driver_info = get_driver_info(session_key, driver_number)
+        weather = get_weather(meeting_key)
+
+        # 6) Build context + call RaceMeta
+        stint_text, before_comp, after_comp = summarise_stints(stints, pit_lap)
+
+        context_block = build_context_block(
+            session=session,
+            driver_info=driver_info,
+            weather=weather,
+            stint_text=stint_text,
+            before_comp=before_comp,
+            after_comp=after_comp,
+            pit_lap=pit_lap,
+            user_question=question,
+        )
+
+        verdict = call_racemeta(context_block)
+
+        return jsonify({
+            "context": context_block,
+            "verdict": verdict
+        })
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 
 
 @app.route("/", methods=["GET"])
