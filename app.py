@@ -3,6 +3,8 @@ import requests
 import re
 from flask import Flask, request, jsonify
 from openai import OpenAI
+from flask_cors import CORS
+
 
 # -------- CONFIG --------
 
@@ -15,6 +17,7 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 OPENF1_BASE = "https://api.openf1.org/v1"
 
 app = Flask(__name__)
+CORS(app)
 
 # -------- HELPERS: OPENF1 --------
 
