@@ -5,7 +5,6 @@ from flask import Flask, request, jsonify
 from openai import OpenAI
 from flask_cors import CORS
 
-
 # -------- CONFIG --------
 
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
@@ -16,50 +15,22 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 
 OPENF1_BASE = "https://api.openf1.org/v1"
 
-app = Flask(__name__)
-CORS(app)
-
-# -------- HELPERS: OPENF1 --------
-
+# Threads config (for @race.meta bot)
 THREADS_USER_TOKEN = os.environ.get("THREADS_USER_TOKEN")
 THREADS_VERIFY_TOKEN = os.environ.get("THREADS_VERIFY_TOKEN", "changeme")
 THREADS_API_BASE = "https://graph.threads.net/v1.0"
 
+app = Flask(__name__)
+CORS(app)
 
-def threads_post_text_reply(text: str, reply_to_id: str):
-    """
-    Post a text reply on Threads as the authenticated user (@race.meta).
-
-    Uses the 'me/threads' convenience endpoint with auto_publish_text=true
-    and reply_to_id to attach as a reply.
-    """
-    if not THREADS_USER_TOKEN:
-        print("THREADS_USER_TOKEN not set, skipping Threads reply.")
-        return None
-
-    params = {
-        "text": text,
-        "media_type": "TEXT",
-        "reply_to_id": reply_to_id,
-        "auto_publish_text": "true",
-        "access_token": THREADS_USER_TOKEN,
-    }
-
-    try:
-        resp = requests.post(f"{THREADS_API_BASE}/me/threads", params=params, timeout=15)
-        resp.raise_for_status()
-        return resp.json()
-    except Exception as e:
-        print("Error posting reply to Threads:", e)
-        return None
-
+# -------- HELPERS: OPENF1 --------
 
 
 def get_race_session(year: int, country_name: str):
     params = {
         "year": year,
         "country_name": country_name,
-        "session_type": "Race"
+        "session_type": "Race",
     }
     resp = requests.get(f"{OPENF1_BASE}/sessions", params=params, timeout=10)
     resp.raise_for_status()
@@ -68,6 +39,7 @@ def get_race_session(year: int, country_name: str):
         raise ValueError("No race session found. Check year/country spelling.")
     data.sort(key=lambda x: x["date_end"])
     return data[-1]
+
 
 def get_latest_race_session():
     """
@@ -80,9 +52,9 @@ def get_latest_race_session():
     data = resp.json()
     if not data:
         raise ValueError("No race sessions found in OpenF1.")
-    # sort by end date and take latest
     data.sort(key=lambda x: x["date_end"])
     return data[-1]
+
 
 # Mapping from words in the question -> (country_name, track_hint)
 TRACK_KEYWORDS = {
@@ -125,9 +97,9 @@ TRACK_KEYWORDS = {
     "qatar": ("Qatar", "Qatar"),
     "losail": ("Qatar", "Losail"),
 
-    # Americas (all in USA/Canada/Brazil/Mexico)
+    # Americas
     "interlagos": ("Brazil", "Interlagos"),
-    "brazil": ("Brazil", "Interlagos"),   # rough but ok
+    "brazil": ("Brazil", "Interlagos"),
     "cota": ("USA", "Americas"),
     "austin": ("USA", "Americas"),
     "miami": ("USA", "Miami"),
@@ -141,6 +113,7 @@ TRACK_KEYWORDS = {
     "melbourne": ("Australia", "Melbourne"),
     "albert park": ("Australia", "Albert Park"),
 }
+
 
 def choose_session_for_question(question: str):
     """
@@ -165,13 +138,14 @@ def choose_session_for_question(question: str):
 
             track_hint_lower = track_hint.lower()
 
-            # Prefer sessions whose meeting/location/circuit names contain the track_hint
             def has_track_hint(s):
-                text = " ".join([
-                    str(s.get("meeting_name", "")),
-                    str(s.get("location", "")),
-                    str(s.get("circuit_short_name", "")),
-                ]).lower()
+                text = " ".join(
+                    [
+                        str(s.get("meeting_name", "")),
+                        str(s.get("location", "")),
+                        str(s.get("circuit_short_name", "")),
+                    ]
+                ).lower()
                 return track_hint_lower in text
 
             track_sessions = [s for s in sessions if has_track_hint(s)]
@@ -210,7 +184,6 @@ def get_driver_info(session_key: int, driver_number: int):
         return None
     return data[0]
 
-import re  # at top of file if not already imported
 
 def detect_driver_number_from_question(question: str, session_key: int):
     """
@@ -225,7 +198,7 @@ def detect_driver_number_from_question(question: str, session_key: int):
     resp.raise_for_status()
     drivers = resp.json()
 
-    # First, try to match by any of first/last/full/broadcast name appearing in the question
+    # Try matching by name variants
     for d in drivers:
         candidates = set()
         if d.get("full_name"):
@@ -238,14 +211,10 @@ def detect_driver_number_from_question(question: str, session_key: int):
             candidates.add(d["broadcast_name"].lower())
 
         for name in candidates:
-            if not name:
-                continue
-            # Simple containment check
-            if name in q:
+            if name and name in q:
                 return d["driver_number"]
 
-    # Fallback: some common short-name nicknames
-    # (this handles 'lewis', 'max', 'checo', 'lando' etc if above didn't catch)
+    # Fallback nicknames
     nickname_map = {
         "lewis": 44,
         "hamilton": 44,
@@ -269,6 +238,7 @@ def detect_driver_number_from_question(question: str, session_key: int):
 
     return None
 
+
 def detect_lap_from_question(question: str):
     """
     Look for patterns like 'lap 16' in the question.
@@ -282,7 +252,6 @@ def detect_lap_from_question(question: str):
         except ValueError:
             return None
     return None
-
 
 
 def summarise_stints(stints, pit_lap: int):
@@ -308,7 +277,6 @@ def summarise_stints(stints, pit_lap: int):
     return "\n".join(lines), before_comp, after_comp
 
 
-
 # -------- RACEMETA PROMPT --------
 
 RACEMETA_SYSTEM_PROMPT = """
@@ -331,9 +299,22 @@ Rules:
 - If data is missing, lean on typical F1 strategy logic but stay grounded.
 """
 
-def build_context_block(session, driver_info, weather, stint_text,
-                        before_comp, after_comp, pit_lap, user_question):
-    track_name = session.get("circuit_short_name") or session.get("location") or "Unknown circuit"
+
+def build_context_block(
+    session,
+    driver_info,
+    weather,
+    stint_text,
+    before_comp,
+    after_comp,
+    pit_lap,
+    user_question,
+):
+    track_name = (
+        session.get("circuit_short_name")
+        or session.get("location")
+        or "Unknown circuit"
+    )
     country = session.get("country_name", "Unknown country")
     year = session.get("year", "Unknown year")
 
@@ -354,7 +335,7 @@ def build_context_block(session, driver_info, weather, stint_text,
         "Tyre & stint data:",
         stint_text,
         "",
-        f"Pit of interest: lap {pit_lap} (from {before_comp} to {after_comp})"
+        f"Pit of interest: lap {pit_lap} (from {before_comp} to {after_comp})",
     ]
 
     if track_temp is not None:
@@ -373,7 +354,7 @@ def call_racemeta(context_block: str) -> str:
         model="gpt-5.1",
         messages=[
             {"role": "system", "content": RACEMETA_SYSTEM_PROMPT},
-            {"role": "user", "content": context_block}
+            {"role": "user", "content": context_block},
         ],
         temperature=0.4,
         max_completion_tokens=180,
@@ -381,14 +362,41 @@ def call_racemeta(context_block: str) -> str:
     return completion.choices[0].message.content.strip()
 
 
+# -------- THREADS HELPER --------
 
-# -------- HTTP ENDPOINT --------
 
-from flask import Flask, request, jsonify  # re-import to be safe
+def threads_post_text_reply(text: str, reply_to_id: str):
+    """
+    Post a text reply on Threads as the authenticated user (@race.meta).
+    """
+    if not THREADS_USER_TOKEN:
+        print("THREADS_USER_TOKEN not set, skipping Threads reply.")
+        return None
+
+    params = {
+        "text": text,
+        "media_type": "TEXT",
+        "reply_to_id": reply_to_id,
+        "auto_publish_text": "true",
+        "access_token": THREADS_USER_TOKEN,
+    }
+
+    try:
+        resp = requests.post(
+            f"{THREADS_API_BASE}/me/threads", params=params, timeout=15
+        )
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as e:
+        print("Error posting reply to Threads:", e)
+        return None
+
+
+# -------- HTTP ENDPOINTS --------
+
 
 @app.route("/analyze", methods=["POST"])
 def analyze():
-
     try:
         data = request.get_json(force=True)
         year = int(data["year"])
@@ -422,20 +430,17 @@ def analyze():
 
         verdict = call_racemeta(context_block)
 
-        return jsonify({
-            "context": context_block,
-            "verdict": verdict
-        })
+        return jsonify({"context": context_block, "verdict": verdict})
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
 
 def analyze_latest_core(question: str):
     """
     Core logic for 'latest race' natural-language analysis.
     Returns (context_block, verdict).
     """
-
     # 1) Choose race session based on question (track-aware)
     session = choose_session_for_question(question)
     session_key = session["session_key"]
@@ -459,7 +464,9 @@ def analyze_latest_core(question: str):
         if len(stints_sorted) > 1:
             pit_lap = stints_sorted[1]["lap_start"] - 1
         else:
-            pit_lap = (stints_sorted[0]["lap_start"] + stints_sorted[0]["lap_end"]) // 2
+            pit_lap = (
+                stints_sorted[0]["lap_start"] + stints_sorted[0]["lap_end"]
+            ) // 2
 
     # 5) Driver + weather
     driver_info = get_driver_info(session_key, driver_number)
@@ -484,26 +491,7 @@ def analyze_latest_core(question: str):
     return context_block, verdict
 
 
-
-
 @app.route("/analyze_latest", methods=["POST"])
-def analyze_latest():
-    """
-    Natural-language endpoint.
-
-    Expects JSON:
-    {
-      "question": "Was it right to pit Lewis or extend his stint?"
-    }
-
-    Logic:
-    - Use latest race from OpenF1.
-    - Detect driver from question.
-    - Detect lap from question if present.
-    - If no lap, choose first pit stop (between stint 1 and 2).
-    - Reuse existing RaceMeta pipeline.
-    """
- @app.route("/analyze_latest", methods=["POST"])
 def analyze_latest():
     """
     Natural-language endpoint.
@@ -522,13 +510,11 @@ def analyze_latest():
     try:
         context_block, verdict = analyze_latest_core(question)
 
-        return jsonify({
-            "context": context_block,
-            "verdict": verdict
-        })
+        return jsonify({"context": context_block, "verdict": verdict})
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
 
 @app.route("/threads_webhook", methods=["GET", "POST"])
 def threads_webhook():
@@ -539,7 +525,6 @@ def threads_webhook():
     - POST: handle mention events, run RaceMeta, and reply.
     """
     if request.method == "GET":
-        # Verification step from Meta
         mode = request.args.get("hub.mode")
         token = request.args.get("hub.verify_token")
         challenge = request.args.get("hub.challenge")
@@ -554,7 +539,6 @@ def threads_webhook():
     except Exception:
         return "Invalid payload", 400
 
-    # Very defensive parsing: structure may evolve
     try:
         entries = payload.get("entry", [])
         for entry in entries:
@@ -562,7 +546,6 @@ def threads_webhook():
             for change in changes:
                 value = change.get("value", {})
 
-                # Meta's docs show 'text' and 'media_id' in mention payloads
                 mention_text = value.get("text") or value.get("message")
                 media_id = value.get("media_id") or value.get("id")
 
@@ -570,14 +553,14 @@ def threads_webhook():
                     continue
 
                 # Strip '@race.meta' from the text to get the actual question
-                question = re.sub(r"@race\\.meta", "", mention_text, flags=re.IGNORECASE).strip()
+                question = re.sub(
+                    r"@race\\.meta", "", mention_text, flags=re.IGNORECASE
+                ).strip()
                 if not question:
                     continue
 
                 try:
                     _, verdict = analyze_latest_core(question)
-
-                    # You might later trim verdict if you want it ultra short
                     threads_post_text_reply(verdict, reply_to_id=str(media_id))
                 except Exception as e:
                     print("Error handling mention:", e)
@@ -597,3 +580,4 @@ def health():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     app.run(host="0.0.0.0", port=port)
+
