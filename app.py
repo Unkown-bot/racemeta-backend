@@ -21,6 +21,40 @@ CORS(app)
 
 # -------- HELPERS: OPENF1 --------
 
+THREADS_USER_TOKEN = os.environ.get("THREADS_USER_TOKEN")
+THREADS_VERIFY_TOKEN = os.environ.get("THREADS_VERIFY_TOKEN", "changeme")
+THREADS_API_BASE = "https://graph.threads.net/v1.0"
+
+
+def threads_post_text_reply(text: str, reply_to_id: str):
+    """
+    Post a text reply on Threads as the authenticated user (@race.meta).
+
+    Uses the 'me/threads' convenience endpoint with auto_publish_text=true
+    and reply_to_id to attach as a reply.
+    """
+    if not THREADS_USER_TOKEN:
+        print("THREADS_USER_TOKEN not set, skipping Threads reply.")
+        return None
+
+    params = {
+        "text": text,
+        "media_type": "TEXT",
+        "reply_to_id": reply_to_id,
+        "auto_publish_text": "true",
+        "access_token": THREADS_USER_TOKEN,
+    }
+
+    try:
+        resp = requests.post(f"{THREADS_API_BASE}/me/threads", params=params, timeout=15)
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as e:
+        print("Error posting reply to Threads:", e)
+        return None
+
+
+
 def get_race_session(year: int, country_name: str):
     params = {
         "year": year,
@@ -396,6 +430,61 @@ def analyze():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+def analyze_latest_core(question: str):
+    """
+    Core logic for 'latest race' natural-language analysis.
+    Returns (context_block, verdict).
+    """
+
+    # 1) Choose race session based on question (track-aware)
+    session = choose_session_for_question(question)
+    session_key = session["session_key"]
+    meeting_key = session["meeting_key"]
+
+    # 2) Detect driver
+    driver_number = detect_driver_number_from_question(question, session_key)
+    if driver_number is None:
+        raise ValueError("Could not detect driver from question for latest race.")
+
+    # 3) Fetch stints for this driver
+    stints = get_stints(session_key, driver_number)
+    if not stints:
+        raise ValueError("No stint data for this driver in latest race.")
+
+    # 4) Detect lap from question, else infer first stop from stints
+    pit_lap = detect_lap_from_question(question)
+    stints_sorted = sorted(stints, key=lambda s: s["stint_number"])
+
+    if pit_lap is None:
+        if len(stints_sorted) > 1:
+            pit_lap = stints_sorted[1]["lap_start"] - 1
+        else:
+            pit_lap = (stints_sorted[0]["lap_start"] + stints_sorted[0]["lap_end"]) // 2
+
+    # 5) Driver + weather
+    driver_info = get_driver_info(session_key, driver_number)
+    weather = get_weather(meeting_key)
+
+    # 6) Build context + call RaceMeta
+    stint_text, before_comp, after_comp = summarise_stints(stints, pit_lap)
+
+    context_block = build_context_block(
+        session=session,
+        driver_info=driver_info,
+        weather=weather,
+        stint_text=stint_text,
+        before_comp=before_comp,
+        after_comp=after_comp,
+        pit_lap=pit_lap,
+        user_question=question,
+    )
+
+    verdict = call_racemeta(context_block)
+
+    return context_block, verdict
+
+
+
 
 @app.route("/analyze_latest", methods=["POST"])
 def analyze_latest():
@@ -414,6 +503,16 @@ def analyze_latest():
     - If no lap, choose first pit stop (between stint 1 and 2).
     - Reuse existing RaceMeta pipeline.
     """
+ @app.route("/analyze_latest", methods=["POST"])
+def analyze_latest():
+    """
+    Natural-language endpoint.
+
+    Expects JSON:
+    {
+      "question": "Was it right to pit Lewis or extend his stint?"
+    }
+    """
     try:
         data = request.get_json(force=True)
         question = str(data["question"])
@@ -421,51 +520,7 @@ def analyze_latest():
         return jsonify({"error": f"Invalid payload: {e}"}), 400
 
     try:
-        # 1) Choose race session based on question (track-aware)
-        session = choose_session_for_question(question)
-        session_key = session["session_key"]
-        meeting_key = session["meeting_key"]
-
-
-        # 2) Detect driver
-        driver_number = detect_driver_number_from_question(question, session_key)
-        if driver_number is None:
-            return jsonify({"error": "Could not detect driver from question for latest race."}), 400
-
-        # 3) Fetch stints for this driver
-        stints = get_stints(session_key, driver_number)
-        if not stints:
-            return jsonify({"error": "No stint data for this driver in latest race."}), 400
-
-        # 4) Detect lap from question, else infer first stop from stints
-        pit_lap = detect_lap_from_question(question)
-        stints_sorted = sorted(stints, key=lambda s: s["stint_number"])
-
-        if pit_lap is None:
-            if len(stints_sorted) > 1:
-                pit_lap = stints_sorted[1]["lap_start"] - 1
-            else:
-                pit_lap = (stints_sorted[0]["lap_start"] + stints_sorted[0]["lap_end"]) // 2
-
-        # 5) Driver + weather
-        driver_info = get_driver_info(session_key, driver_number)
-        weather = get_weather(meeting_key)
-
-        # 6) Build context + call RaceMeta
-        stint_text, before_comp, after_comp = summarise_stints(stints, pit_lap)
-
-        context_block = build_context_block(
-            session=session,
-            driver_info=driver_info,
-            weather=weather,
-            stint_text=stint_text,
-            before_comp=before_comp,
-            after_comp=after_comp,
-            pit_lap=pit_lap,
-            user_question=question,
-        )
-
-        verdict = call_racemeta(context_block)
+        context_block, verdict = analyze_latest_core(question)
 
         return jsonify({
             "context": context_block,
@@ -475,6 +530,63 @@ def analyze_latest():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+@app.route("/threads_webhook", methods=["GET", "POST"])
+def threads_webhook():
+    """
+    Webhook for Threads mentions.
+
+    - GET: verification handshake with Meta (hub.challenge).
+    - POST: handle mention events, run RaceMeta, and reply.
+    """
+    if request.method == "GET":
+        # Verification step from Meta
+        mode = request.args.get("hub.mode")
+        token = request.args.get("hub.verify_token")
+        challenge = request.args.get("hub.challenge")
+
+        if mode == "subscribe" and token == THREADS_VERIFY_TOKEN:
+            return challenge, 200
+        return "Verification failed", 403
+
+    # POST = actual events
+    try:
+        payload = request.get_json(force=True)
+    except Exception:
+        return "Invalid payload", 400
+
+    # Very defensive parsing: structure may evolve
+    try:
+        entries = payload.get("entry", [])
+        for entry in entries:
+            changes = entry.get("changes", [])
+            for change in changes:
+                value = change.get("value", {})
+
+                # Meta's docs show 'text' and 'media_id' in mention payloads
+                mention_text = value.get("text") or value.get("message")
+                media_id = value.get("media_id") or value.get("id")
+
+                if not mention_text or not media_id:
+                    continue
+
+                # Strip '@race.meta' from the text to get the actual question
+                question = re.sub(r"@race\\.meta", "", mention_text, flags=re.IGNORECASE).strip()
+                if not question:
+                    continue
+
+                try:
+                    _, verdict = analyze_latest_core(question)
+
+                    # You might later trim verdict if you want it ultra short
+                    threads_post_text_reply(verdict, reply_to_id=str(media_id))
+                except Exception as e:
+                    print("Error handling mention:", e)
+
+    except Exception as e:
+        print("Error parsing Threads webhook payload:", e)
+
+    # Always 200 so Meta doesn't keep retrying forever
+    return "OK", 200
 
 
 @app.route("/", methods=["GET"])
