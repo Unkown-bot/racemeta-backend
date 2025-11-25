@@ -415,24 +415,31 @@ def parse_racemeta_verdict(verdict_text: str):
     if m_verdict:
         summary = m_verdict.group(1).strip()
 
-    # Why-section (between Why: and Alt/Take or end)
+    # Why-section (between "Why:" and the next "Alt:" or "Take:" line or end)
     reasoning = []
-    if "Why:" in text:
-        why_part = text.split("Why:", 1)[1]
-        # Cut off at Alt: or Take:
-        why_part = re.split(r"\bAlt:\b|\bTake:\b", why_part, flags=re.IGNORECASE)[0]
-        # Split into bullet lines
+    m_why = re.search(
+        r"Why:\s*([\s\S]*?)(?:\nAlt:|\nTake:|$)",
+        text,
+        re.IGNORECASE,
+    )
+    if m_why:
+        why_part = m_why.group(1)
         for line in why_part.splitlines():
             l = line.strip()
             if not l:
                 continue
+            # Strip leading "- " or "• "
             l = re.sub(r"^[-•]\s*", "", l)
             if l:
                 reasoning.append(l)
 
-    # Alt: recommended_strategy (until Take: or end)
+    # Alt: recommended_strategy (between "Alt:" and "Take:" or end)
     recommended_strategy = ""
-    m_alt = re.search(r"Alt:\s*([^]*?)(?:\bTake:\b|$)", text, re.IGNORECASE)
+    m_alt = re.search(
+        r"Alt:\s*([\s\S]*?)(?:\nTake:|$)",
+        text,
+        re.IGNORECASE,
+    )
     if m_alt:
         recommended_strategy = m_alt.group(1).strip()
 
@@ -444,6 +451,7 @@ def parse_racemeta_verdict(verdict_text: str):
         "reasoning": reasoning,
         "recommended_strategy": recommended_strategy,
     }
+
 
 
 def extract_race_context_from_context_block(context_block: str, fallback_pit_lap=None):
