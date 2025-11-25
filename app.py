@@ -1,9 +1,9 @@
 import os
-import requests
 import re
+import requests
 from flask import Flask, request, jsonify
-from openai import OpenAI
 from flask_cors import CORS
+from openai import OpenAI
 
 # -------- CONFIG --------
 
@@ -32,7 +32,7 @@ def get_race_session(year: int, country_name: str):
         "country_name": country_name,
         "session_type": "Race",
     }
-    resp = requests.get(f"{OPENF1_BASE}/sessions", params=params, timeout=10)
+    resp = requests.get(f"{OPENF1_BASE}/sessions", params=params, timeout=15)
     resp.raise_for_status()
     data = resp.json()
     if not data:
@@ -47,7 +47,7 @@ def get_latest_race_session():
     Used when the user just asks about 'Lewis' etc without specifying race.
     """
     params = {"session_type": "Race"}
-    resp = requests.get(f"{OPENF1_BASE}/sessions", params=params, timeout=10)
+    resp = requests.get(f"{OPENF1_BASE}/sessions", params=params, timeout=15)
     resp.raise_for_status()
     data = resp.json()
     if not data:
@@ -130,7 +130,7 @@ def choose_session_for_question(question: str):
         if keyword in q:
             # Fetch all races in that country
             params = {"session_type": "Race", "country_name": country_name}
-            resp = requests.get(f"{OPENF1_BASE}/sessions", params=params, timeout=10)
+            resp = requests.get(f"{OPENF1_BASE}/sessions", params=params, timeout=15)
             resp.raise_for_status()
             sessions = resp.json()
             if not sessions:
@@ -160,14 +160,14 @@ def choose_session_for_question(question: str):
 
 def get_stints(session_key: int, driver_number: int):
     params = {"session_key": session_key, "driver_number": driver_number}
-    resp = requests.get(f"{OPENF1_BASE}/stints", params=params, timeout=10)
+    resp = requests.get(f"{OPENF1_BASE}/stints", params=params, timeout=15)
     resp.raise_for_status()
     return resp.json()
 
 
 def get_weather(meeting_key: int):
     params = {"meeting_key": meeting_key}
-    resp = requests.get(f"{OPENF1_BASE}/weather", params=params, timeout=10)
+    resp = requests.get(f"{OPENF1_BASE}/weather", params=params, timeout=15)
     resp.raise_for_status()
     data = resp.json()
     if not data:
@@ -177,7 +177,7 @@ def get_weather(meeting_key: int):
 
 def get_driver_info(session_key: int, driver_number: int):
     params = {"session_key": session_key, "driver_number": driver_number}
-    resp = requests.get(f"{OPENF1_BASE}/drivers", params=params, timeout=10)
+    resp = requests.get(f"{OPENF1_BASE}/drivers", params=params, timeout=15)
     resp.raise_for_status()
     data = resp.json()
     if not data:
@@ -194,7 +194,7 @@ def detect_driver_number_from_question(question: str, session_key: int):
 
     # Fetch all drivers for this session
     params = {"session_key": session_key}
-    resp = requests.get(f"{OPENF1_BASE}/drivers", params=params, timeout=10)
+    resp = requests.get(f"{OPENF1_BASE}/drivers", params=params, timeout=15)
     resp.raise_for_status()
     drivers = resp.json()
 
@@ -253,145 +253,6 @@ def detect_lap_from_question(question: str):
             return None
     return None
 
-def parse_positions_from_question(question: str):
-    """
-    Try to detect start/end positions like 'P2 → P4' or 'P2 to P4' from the question.
-    Falls back to a single 'P5' if that's all we have.
-    """
-    q = question.upper()
-    # Pattern like P2 -> P4, P2 → P4, P2 to P4
-    m_range = re.search(r"P(\d+)\s*(?:→|->|to|-|–)\s*P(\d+)", q)
-    if m_range:
-        start = int(m_range.group(1))
-        end = int(m_range.group(2))
-        return start, end
-
-    # Single Pn mentioned
-    m_single = re.search(r"P(\d+)", q)
-    if m_single:
-        end = int(m_single.group(1))
-        return None, end
-
-    return None, None
-
-
-def compute_metrics_from_stints(stints, pit_lap: int, question: str):
-    """
-    Build the metrics dict that the frontend expects, using real stint data
-    and light heuristics from the question text.
-    """
-    metrics = {}
-
-    if not stints:
-        return metrics
-
-    stints_sorted = sorted(stints, key=lambda s: s["stint_number"])
-    current_stint = None
-    for stint in stints_sorted:
-        if stint["lap_start"] <= pit_lap <= stint["lap_end"]:
-            current_stint = stint
-            break
-    if current_stint is None:
-        current_stint = stints_sorted[0]
-
-    stint_start = current_stint["lap_start"]
-    stint_end = current_stint["lap_end"]
-    stint_len = stint_end - stint_start + 1
-    laps_used = pit_lap - stint_start + 1
-    laps_left = max(stint_end - pit_lap, 0)
-
-    # --- 1) Tyre life ---
-    # Score: more laps left = more conservative (= lower score from a "fully used" POV).
-    # We keep this fairly neutral in impact for now.
-    if stint_len > 0:
-        used_frac = laps_used / stint_len
-        # 0 = boxed immediately; 100 = ran full stint
-        tyre_life_score = int(max(0, min(100, used_frac * 100)))
-    else:
-        tyre_life_score = 50
-
-    metrics["tyre_life"] = {
-        "label": "Tyre life",
-        "value": f"{laps_left} laps",
-        "description": "Estimated usable life left in this stint when the stop was made.",
-        "score": tyre_life_score,
-        "impact": "neutral",
-    }
-
-    # --- 2) Undercut window (rough) ---
-    # Use the stint as a guide: call the "natural" window between 40–70% of stint length.
-    if stint_len >= 6:
-        win_start = stint_start + int(0.4 * stint_len)
-        win_end = stint_start + int(0.7 * stint_len)
-        metrics["undercut_window"] = {
-            "label": "Undercut window",
-            "value": f"Laps {win_start}-{win_end}",
-            "description": "Approximate first-stop window based on this stint’s length.",
-            "score": 60,
-            "impact": "neutral",
-        }
-
-    # --- 3) Track position & final position (from question text) ---
-    start_pos, end_pos = parse_positions_from_question(question)
-    if end_pos is not None:
-        metrics["final_position"] = {
-            "label": "Final position",
-            "value": f"P{end_pos}",
-            "description": "Finishing position based on your prompt.",
-            "score": max(0, 100 - (end_pos - 1) * 5),
-            "impact": "neutral",
-        }
-
-    if start_pos is not None and end_pos is not None:
-        delta = end_pos - start_pos
-        sign = "+" if delta > 0 else ""
-        metrics["track_position"] = {
-            "label": "Track position",
-            "value": f"{sign}{delta} places",
-            "description": "Places lost / gained across the pit cycle (from your prompt).",
-            "score": max(0, 100 - abs(delta) * 10),
-            "impact": "negative" if delta > 0 else ("positive" if delta < 0 else "neutral"),
-        }
-
-    # --- 4) Traffic cost & pace delta (heuristic, but consistent) ---
-    # Idea: if you pitted with lots of life left (conservative) AND you lost places,
-    # we assume extra time spent in traffic vs. clean air.
-    traffic_score = 50
-    pace_score = 50
-    impact_traffic = "neutral"
-    impact_pace = "neutral"
-
-    if laps_left >= 3 and start_pos is not None and end_pos is not None and end_pos > start_pos:
-        # Early stop + position loss -> likely traffic pain
-        traffic_score = 70
-        impact_traffic = "negative"
-        pace_score = 60
-        impact_pace = "positive"
-        traffic_value = "~3–6 sec"
-        pace_value = "+0.2–0.5s/lap"
-    else:
-        traffic_value = "Low"
-        pace_value = "Small"
-
-    metrics["traffic_cost"] = {
-        "label": "Traffic cost",
-        "value": traffic_value,
-        "description": "Rough estimate of time lost fighting cars vs. staying in clean air.",
-        "score": traffic_score,
-        "impact": impact_traffic,
-    }
-
-    metrics["pace_delta"] = {
-        "label": "Pace delta",
-        "value": pace_value,
-        "description": "Approximate post-stop pace advantage vs. rivals, inferred from the stint shape.",
-        "score": pace_score,
-        "impact": impact_pace,
-    }
-
-    return metrics
-
-
 
 def summarise_stints(stints, pit_lap: int):
     if not stints:
@@ -416,69 +277,6 @@ def summarise_stints(stints, pit_lap: int):
     return "\n".join(lines), before_comp, after_comp
 
 
-def compute_metrics_from_openf1(stints, pit_lap: int, driver_info):
-    """
-    Build a small metrics dict using only real OpenF1 data.
-
-    - Tyre life: how many laps of the current stint were still unused at the pit lap
-    - Final position: finishing position from OpenF1 driver info
-    """
-    metrics = {}
-
-    # --- Tyre life ---
-    if stints:
-        stints_sorted = sorted(stints, key=lambda s: s["stint_number"])
-        for stint in stints_sorted:
-            ls = stint["lap_start"]
-            le = stint["lap_end"]
-            if ls <= pit_lap <= le:
-                stint_len = (le - ls + 1)
-                laps_used = pit_lap - ls + 1
-                laps_remaining = max(0, le - pit_lap)
-
-                if stint_len > 0:
-                    life_score = int(
-                        max(0, min(100, (laps_remaining / stint_len) * 100))
-                    )
-                else:
-                    life_score = 0
-
-                metrics["tyre_life"] = {
-                    "label": "Tyre life",
-                    "value": f"{laps_remaining} laps",
-                    "description": "Estimated usable life left in this stint when the stop was made.",
-                    "score": life_score,
-                    "impact": "positive" if laps_remaining >= 3 else "neutral",
-                }
-                break
-
-    # --- Final position ---
-    if driver_info:
-        finishing_pos = (
-            driver_info.get("position")
-            or driver_info.get("position_over_line")
-            or driver_info.get("classification_position")
-        )
-
-        try:
-            if finishing_pos is not None:
-                pos_int = int(finishing_pos)
-                # Simple mapping: P1 = 100, P2 = 90, P3 = 80, etc.
-                score = max(0, min(100, 110 - pos_int * 10))
-
-                metrics["final_position"] = {
-                    "label": "Final position",
-                    "value": f"P{pos_int}",
-                    "description": "Classified finishing position in this race.",
-                    "score": score,
-                    "impact": "positive" if pos_int <= 3 else "negative",
-                }
-        except (TypeError, ValueError):
-            pass
-
-    return metrics
-
-
 # -------- RACEMETA PROMPT --------
 
 RACEMETA_SYSTEM_PROMPT = """
@@ -487,7 +285,7 @@ You are RaceMeta, an F1 pit-wall meta strategist. You explain race strategy call
 
 You ALWAYS answer in this format:
 
-Verdict: 2–8 words, strong opinion – e.g. "Optimal cover", "Costly overcut", "Mixed – defendable">
+Verdict: <2–5 words, strong opinion – e.g. "Optimal cover", "Costly overcut", "Mixed – defendable">
 Why:
 - Point 1 (max ~18 words, ONE clear idea)
 - Point 2
@@ -513,7 +311,7 @@ Why:
 Alt: Ask the user for 1–2 specific details.
 Take: Clear inputs = sharper strategy calls.
 
-
+Never add anything outside this template.
 """
 
 
@@ -574,76 +372,75 @@ def call_racemeta(context_block: str) -> str:
             {"role": "user", "content": context_block},
         ],
         temperature=0.4,
-        max_completion_tokens=180,
+        max_completion_tokens=220,
     )
     return completion.choices[0].message.content.strip()
 
 
-def classify_verdict_text(text: str) -> str:
-    t = (text or "").lower()
-    if "suboptimal" in t or "too early" in t or "too late" in t or "costly" in t:
-        return "suboptimal"
-    if "optimal" in t or "great call" in t or "right call" in t or "good call" in t:
-        return "optimal"
-    if "need more info" in t:
-        return "neutral"
-    return "neutral"
+# -------- PARSING & METRICS HELPERS --------
 
 
-def parse_racemeta_output(verdict_raw: str):
+def parse_racemeta_output(text: str):
     """
-    Take the full template text from RaceMeta and extract:
-    - one-line summary
-    - reasoning bullets
-    - recommended strategy
+    Parse the structured RaceMeta template into fields:
+    summary, verdict_type, reasoning list, recommended_strategy, confidence (heuristic).
     """
-    text = verdict_raw or ""
+    if not text:
+        return {
+            "summary": "",
+            "verdict_type": "neutral",
+            "reasoning": [],
+            "recommended_strategy": None,
+            "confidence": 70,
+        }
 
-    # Extract the verdict line after "Verdict:"
-    summary = text
-    m = re.search(r"Verdict:\s*(.+)", text)
-    if m:
-        summary = m.group(1).strip()
+    # Basic verdict_type classification
+    lower = text.lower()
+    if "suboptimal" in lower or "costly" in lower or "too early" in lower or "too late" in lower:
+        verdict_type = "suboptimal"
+    elif "optimal" in lower or "right call" in lower or "great call" in lower:
+        verdict_type = "optimal"
+    elif "need more info" in lower:
+        verdict_type = "neutral"
+    else:
+        verdict_type = "neutral"
 
-    # Reasoning: lines under "Why:" starting with - or •
+    # Summary: line after "Verdict:"
+    summary = ""
+    m_verdict = re.search(r"Verdict:\s*(.+)", text)
+    if m_verdict:
+        summary = m_verdict.group(1).strip()
+
+    # Why bullets
     reasoning = []
-    why_match = re.search(
-        r"Why:\s*(.*?)(?:Alt:|Take:|$)",
-        text,
-        re.IGNORECASE | re.DOTALL,
-    )
-    if why_match:
-        block = why_match.group(1)
-        for line in block.splitlines():
+    m_why = re.search(r"Why:\s*(.+?)(?:\nAlt:|\nTake:|\Z)", text, flags=re.DOTALL)
+    if m_why:
+        block = m_why.group(1)
+        lines = block.split("\n")
+        for line in lines:
             line = line.strip()
-            if not line:
-                continue
-            if line.startswith("-") or line.startswith("•"):
-                line = line[1:].strip()
+            line = re.sub(r"^[\-\•]\s*", "", line)
             if line:
                 reasoning.append(line)
 
-    # Recommended strategy from "Alt:"
-    recommended_strategy = None
-    alt_match = re.search(
-        r"Alt:\s*(.*?)(?:Take:|$)",
-        text,
-        re.IGNORECASE | re.DOTALL,
-    )
-    if alt_match:
-        recommended_strategy = alt_match.group(1).strip()
+    # Alt line
+    recommended = None
+    m_alt = re.search(r"Alt:\s*(.+?)(?:\nTake:|\Z)", text, flags=re.DOTALL)
+    if m_alt:
+        recommended = m_alt.group(1).strip()
 
-    verdict_type = classify_verdict_text(text)
-    confidence = 80  # default; we can tune later if we want
+    # Confidence heuristic: more bullets → more confident
+    base_conf = 75
+    extra = min(len(reasoning) * 3, 15)
+    confidence = base_conf + extra
 
     return {
         "summary": summary,
-        "reasoning": reasoning,
-        "recommended_strategy": recommended_strategy,
         "verdict_type": verdict_type,
+        "reasoning": reasoning,
+        "recommended_strategy": recommended,
         "confidence": confidence,
     }
-
 
 
 def build_race_context(session, driver_info, pit_lap: int):
@@ -652,79 +449,202 @@ def build_race_context(session, driver_info, pit_lap: int):
         or session.get("location")
         or "Unknown circuit"
     )
-    country = session.get("country_name", "Unknown country")
-    year = session.get("year", "Unknown year")
-    race_label = f"{country} {year} ({track_name})"
-
+    country = session.get("country_name", "Race")
+    year = session.get("year", "")
     driver_name = driver_info.get("full_name") if driver_info else "Unknown driver"
-
-    # Some OpenF1 dumps have position-like fields
-    finishing_pos = (
-        driver_info.get("position")
-        or driver_info.get("position_over_line")
-        or driver_info.get("classification_position")
-        if driver_info
-        else None
-    )
-    try:
-        if finishing_pos is not None:
-            pos_str = f"P{int(finishing_pos)}"
-        else:
-            pos_str = None
-    except (TypeError, ValueError):
-        pos_str = None
 
     return {
         "driver": driver_name,
-        "race": race_label,
+        "race": f"{country} {year} ({track_name})",
         "lap": pit_lap,
-        "position": pos_str,
-        "label": f"{driver_name} – {race_label} – lap {pit_lap}",
+        "position": None,
+        "label": f"{driver_name} – {country} {year} ({track_name}) – lap {pit_lap}",
     }
 
 
-# -------- THREADS HELPER --------
-
-
-def threads_post_text_reply(text: str, reply_to_id: str):
+def parse_positions_from_question(question: str):
     """
-    Post a text reply on Threads as the authenticated user (@race.meta).
+    Try to detect start/end positions like 'P2 → P4' or 'P2 to P4' from the question.
+    Falls back to a single 'P5' if that's all we have.
     """
-    if not THREADS_USER_TOKEN:
-        print("THREADS_USER_TOKEN not set, skipping Threads reply.")
-        return None
+    q = question.upper()
+    # Pattern like P2 -> P4, P2 → P4, P2 to P4, P2-P4
+    m_range = re.search(r"P(\d+)\s*(?:→|->|TO|–|-)\s*P(\d+)", q)
+    if m_range:
+        start = int(m_range.group(1))
+        end = int(m_range.group(2))
+        return start, end
 
-    params = {
-        "text": text,
-        "media_type": "TEXT",
-        "reply_to_id": reply_to_id,
-        "auto_publish_text": "true",
-        "access_token": THREADS_USER_TOKEN,
+    # Single Pn mentioned
+    m_single = re.search(r"P(\d+)", q)
+    if m_single:
+        end = int(m_single.group(1))
+        return None, end
+
+    return None, None
+
+
+def compute_metrics_from_stints(stints, pit_lap: int, question: str):
+    """
+    Build the metrics dict that the frontend expects, using real stint data
+    and light heuristics from the question text.
+    """
+    metrics = {}
+
+    if not stints:
+        return metrics
+
+    stints_sorted = sorted(stints, key=lambda s: s["stint_number"])
+    current_stint = None
+    for stint in stints_sorted:
+        if stint["lap_start"] <= pit_lap <= stint["lap_end"]:
+            current_stint = stint
+            break
+    if current_stint is None:
+        current_stint = stints_sorted[0]
+
+    stint_start = current_stint["lap_start"]
+    stint_end = current_stint["lap_end"]
+    stint_len = stint_end - stint_start + 1
+    laps_used = pit_lap - stint_start + 1
+    laps_left = max(stint_end - pit_lap, 0)
+
+    # --- 1) Tyre life ---
+    # Score: 0 = boxed immediately; 100 = ran full stint to the end
+    if stint_len > 0:
+        used_frac = laps_used / stint_len
+        tyre_life_score = int(max(0, min(100, used_frac * 100)))
+    else:
+        tyre_life_score = 50
+
+    metrics["tyre_life"] = {
+        "label": "Tyre life",
+        "value": f"{laps_left} laps",
+        "description": "Estimated usable life left in this stint when the stop was made.",
+        "score": tyre_life_score,
+        "impact": "neutral",
     }
 
-    try:
-        resp = requests.post(
-            f"{THREADS_API_BASE}/me/threads", params=params, timeout=15
-        )
-        resp.raise_for_status()
-        return resp.json()
-    except Exception as e:
-        print("Error posting reply to Threads:", e)
-        return None
+    # --- 2) Undercut window (rough) ---
+    # Use the stint as a guide: call the "natural" window between 40–70% of stint length.
+    if stint_len >= 6:
+        win_start = stint_start + int(0.4 * stint_len)
+        win_end = stint_start + int(0.7 * stint_len)
+        metrics["undercut_window"] = {
+            "label": "Undercut window",
+            "value": f"Laps {win_start}-{win_end}",
+            "description": "Approximate first-stop window based on this stint’s length.",
+            "score": 60,
+            "impact": "neutral",
+        }
+
+    # --- 3) Track position & final position (from question text) ---
+    start_pos, end_pos = parse_positions_from_question(question)
+    if end_pos is not None:
+        metrics["final_position"] = {
+            "label": "Final position",
+            "value": f"P{end_pos}",
+            "description": "Finishing position based on your prompt.",
+            "score": max(0, 100 - (end_pos - 1) * 5),
+            "impact": "neutral",
+        }
+
+    if start_pos is not None and end_pos is not None:
+        delta = end_pos - start_pos
+        sign = "+" if delta > 0 else ""
+        metrics["track_position"] = {
+            "label": "Track position",
+            "value": f"{sign}{delta} places",
+            "description": "Places lost / gained across the pit cycle (from your prompt).",
+            "score": max(0, 100 - abs(delta) * 10),
+            "impact": "negative" if delta > 0 else ("positive" if delta < 0 else "neutral"),
+        }
+
+    # --- 4) Traffic cost & pace delta (heuristic, but consistent) ---
+    traffic_score = 50
+    pace_score = 50
+    impact_traffic = "neutral"
+    impact_pace = "neutral"
+
+    if laps_left >= 3 and start_pos is not None and end_pos is not None and end_pos > start_pos:
+        # Early-ish stop + position loss -> likely traffic pain
+        traffic_score = 70
+        impact_traffic = "negative"
+        pace_score = 60
+        impact_pace = "positive"
+        traffic_value = "~3–6 sec"
+        pace_value = "+0.2–0.5s/lap"
+    else:
+        traffic_value = "Low"
+        pace_value = "Small"
+
+    metrics["traffic_cost"] = {
+        "label": "Traffic cost",
+        "value": traffic_value,
+        "description": "Rough estimate of time lost fighting cars vs. staying in clean air.",
+        "score": traffic_score,
+        "impact": impact_traffic,
+    }
+
+    metrics["pace_delta"] = {
+        "label": "Pace delta",
+        "value": pace_value,
+        "description": "Approximate post-stop pace advantage vs. rivals, inferred from stint shape.",
+        "score": pace_score,
+        "impact": impact_pace,
+    }
+
+    return metrics
 
 
-# -------- CORE ANALYSIS LOGIC --------
+# -------- CORE ANALYSIS FUNCTIONS --------
+
+
+def analyze_structured_core(year: int, country: str, driver_number: int, pit_lap: int, question: str):
+    session = get_race_session(year, country)
+    session_key = session["session_key"]
+    meeting_key = session["meeting_key"]
+
+    driver_info = get_driver_info(session_key, driver_number)
+    stints = get_stints(session_key, driver_number)
+    if not stints:
+        raise ValueError("No stint data found for this driver.")
+
+    stint_text, before_comp, after_comp = summarise_stints(stints, pit_lap)
+    weather = get_weather(meeting_key)
+
+    context_block = build_context_block(
+        session=session,
+        driver_info=driver_info,
+        weather=weather,
+        stint_text=stint_text,
+        before_comp=before_comp,
+        after_comp=after_comp,
+        pit_lap=pit_lap,
+        user_question=question,
+    )
+
+    verdict_text = call_racemeta(context_block)
+    parsed = parse_racemeta_output(verdict_text)
+    race_context = build_race_context(session, driver_info, pit_lap)
+    metrics = compute_metrics_from_stints(stints, pit_lap, question)
+
+    return {
+        "context": context_block,
+        "verdict": verdict_text,
+        "summary": parsed["summary"],
+        "verdict_type": parsed["verdict_type"],
+        "reasoning": parsed["reasoning"],
+        "recommended_strategy": parsed["recommended_strategy"],
+        "confidence": parsed["confidence"],
+        "race_context": race_context,
+        "metrics": metrics,
+    }
 
 
 def analyze_latest_core(question: str):
     """
-    Core logic for 'latest race' natural-language analysis.
-    Returns a structured dict including:
-    - context_block (string)
-    - verdict (string)
-    - summary, verdict_type, reasoning, recommended_strategy, confidence
-    - race_context (dict)
-    - metrics (dict)
+    Natural-language core logic for 'latest race' analysis.
     """
     # 1) Choose race session based on question (track-aware)
     session = choose_session_for_question(question)
@@ -749,9 +669,7 @@ def analyze_latest_core(question: str):
         if len(stints_sorted) > 1:
             pit_lap = stints_sorted[1]["lap_start"] - 1
         else:
-            pit_lap = (
-                stints_sorted[0]["lap_start"] + stints_sorted[0]["lap_end"]
-            ) // 2
+            pit_lap = (stints_sorted[0]["lap_start"] + stints_sorted[0]["lap_end"]) // 2
 
     # 5) Driver + weather
     driver_info = get_driver_info(session_key, driver_number)
@@ -759,7 +677,6 @@ def analyze_latest_core(question: str):
 
     # 6) Build context + call RaceMeta
     stint_text, before_comp, after_comp = summarise_stints(stints, pit_lap)
-
     context_block = build_context_block(
         session=session,
         driver_info=driver_info,
@@ -772,28 +689,21 @@ def analyze_latest_core(question: str):
     )
 
     verdict_text = call_racemeta(context_block)
+    parsed = parse_racemeta_output(verdict_text)
+    race_context = build_race_context(session, driver_info, pit_lap)
+    metrics = compute_metrics_from_stints(stints, pit_lap, question)
 
-# 7) Parse verdict into structured fields
-parsed = parse_racemeta_output(verdict_text)
-race_context = build_race_context(session, driver_info, pit_lap)
-
-# ⬇️ REPLACE this existing line:
-# metrics = compute_metrics_from_openf1(stints, pit_lap, driver_info)
-
-# ⬆️ WITH this:
-metrics = compute_metrics_from_stints(stints, pit_lap, question)
-
-return {
-    "context": context_block,
-    "verdict": verdict_text,
-    "summary": parsed["summary"],
-    "verdict_type": parsed["verdict_type"],
-    "reasoning": parsed["reasoning"],
-    "recommended_strategy": parsed["recommended_strategy"],
-    "confidence": parsed["confidence"],
-    "race_context": race_context,
-    "metrics": metrics,
-}
+    return {
+        "context": context_block,
+        "verdict": verdict_text,
+        "summary": parsed["summary"],
+        "verdict_type": parsed["verdict_type"],
+        "reasoning": parsed["reasoning"],
+        "recommended_strategy": parsed["recommended_strategy"],
+        "confidence": parsed["confidence"],
+        "race_context": race_context,
+        "metrics": metrics,
+    }
 
 
 # -------- HTTP ENDPOINTS --------
@@ -802,8 +712,16 @@ return {
 @app.route("/analyze", methods=["POST"])
 def analyze():
     """
-    Structured endpoint where caller passes explicit year, country, driver_number, pit_lap.
-    Kept simpler; returns the same structured JSON as analyze_latest.
+    Structured endpoint.
+
+    Expects JSON:
+    {
+      "year": 2025,
+      "country": "Bahrain",
+      "driver_number": 16,
+      "pit_lap": 16,
+      "question": "Should Leclerc have pitted on lap 16 in Bahrain?"
+    }
     """
     try:
         data = request.get_json(force=True)
@@ -816,45 +734,8 @@ def analyze():
         return jsonify({"error": f"Invalid payload: {e}"}), 400
 
     try:
-        session = get_race_session(year, country)
-        session_key = session["session_key"]
-        meeting_key = session["meeting_key"]
-
-        driver_info = get_driver_info(session_key, driver_number)
-        stints = get_stints(session_key, driver_number)
-        stint_text, before_comp, after_comp = summarise_stints(stints, pit_lap)
-        weather = get_weather(meeting_key)
-
-        context_block = build_context_block(
-            session=session,
-            driver_info=driver_info,
-            weather=weather,
-            stint_text=stint_text,
-            before_comp=before_comp,
-            after_comp=after_comp,
-            pit_lap=pit_lap,
-            user_question=question,
-        )
-
-        verdict_text = call_racemeta(context_block)
-        parsed = parse_racemeta_output(verdict_text)
-        race_context = build_race_context(session, driver_info, pit_lap)
-        metrics = compute_metrics_from_openf1(stints, pit_lap, driver_info)
-
-        return jsonify(
-            {
-                "context": context_block,
-                "verdict": verdict_text,
-                "summary": parsed["summary"],
-                "verdict_type": parsed["verdict_type"],
-                "reasoning": parsed["reasoning"],
-                "recommended_strategy": parsed["recommended_strategy"],
-                "confidence": parsed["confidence"],
-                "race_context": race_context,
-                "metrics": metrics,
-            }
-        )
-
+        result = analyze_structured_core(year, country, driver_number, pit_lap, question)
+        return jsonify(result)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -919,16 +800,14 @@ def threads_webhook():
                     continue
 
                 # Strip '@race.meta' from the text to get the actual question
-                question = re.sub(
-                    r"@race\.meta", "", mention_text, flags=re.IGNORECASE
-                ).strip()
+                question = re.sub(r"@race\.meta", "", mention_text, flags=re.IGNORECASE).strip()
                 if not question:
                     continue
 
                 try:
-                    core = analyze_latest_core(question)
-                    verdict = core.get("verdict", "")
-                    threads_post_text_reply(verdict, reply_to_id=str(media_id))
+                    result = analyze_latest_core(question)
+                    verdict_text = result.get("verdict", "")
+                    threads_post_text_reply(verdict_text, reply_to_id=str(media_id))
                 except Exception as e:
                     print("Error handling mention:", e)
 
@@ -939,6 +818,33 @@ def threads_webhook():
     return "OK", 200
 
 
+def threads_post_text_reply(text: str, reply_to_id: str):
+    """
+    Post a text reply on Threads as the authenticated user (@race.meta).
+    """
+    if not THREADS_USER_TOKEN:
+        print("THREADS_USER_TOKEN not set, skipping Threads reply.")
+        return None
+
+    params = {
+        "text": text,
+        "media_type": "TEXT",
+        "reply_to_id": reply_to_id,
+        "auto_publish_text": "true",
+        "access_token": THREADS_USER_TOKEN,
+    }
+
+    try:
+        resp = requests.post(
+            f"{THREADS_API_BASE}/me/threads", params=params, timeout=15
+        )
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as e:
+        print("Error posting reply to Threads:", e)
+        return None
+
+
 @app.route("/", methods=["GET"])
 def health():
     return "RaceMeta OpenF1 backend is running.", 200
@@ -947,3 +853,4 @@ def health():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     app.run(host="0.0.0.0", port=port)
+
