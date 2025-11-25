@@ -276,6 +276,70 @@ def summarise_stints(stints, pit_lap: int):
 
     return "\n".join(lines), before_comp, after_comp
 
+def compute_metrics_from_openf1(stints, pit_lap: int, driver_info):
+    """
+    Build a small metrics dict using only real OpenF1 data.
+
+    - Tyre life: how many laps of the current stint were still unused at the pit lap
+    - Final position: finishing position from OpenF1 driver info
+    """
+    metrics = {}
+
+    # --- Tyre life ---
+    if stints:
+        stints_sorted = sorted(stints, key=lambda s: s["stint_number"])
+        for stint in stints_sorted:
+            ls = stint["lap_start"]
+            le = stint["lap_end"]
+            if ls <= pit_lap <= le:
+                stint_len = (le - ls + 1)
+                laps_used = pit_lap - ls + 1
+                laps_remaining = max(0, le - pit_lap)
+
+                # Normalised 0–100 score for the progress bar
+                if stint_len > 0:
+                    life_score = int(max(0, min(100, (laps_remaining / stint_len) * 100)))
+                else:
+                    life_score = 0
+
+                metrics["tyre_life"] = {
+                    "label": "Tyre life",
+                    "value": f"{laps_remaining} laps",
+                    "description": "Estimated usable life left in this stint when the stop was made.",
+                    "score": life_score,
+                    # If you still had a decent margin, that’s generally positive
+                    "impact": "positive" if laps_remaining >= 3 else "neutral",
+                }
+                break
+
+    # --- Final position ---
+    if driver_info:
+        # Different OpenF1 dumps sometimes call this 'position' or similar
+        finishing_pos = (
+            driver_info.get("position")
+            or driver_info.get("position_over_line")
+            or driver_info.get("classification_position")
+        )
+
+        try:
+            if finishing_pos is not None:
+                pos_int = int(finishing_pos)
+                # Simple mapping: P1 = 100, P2 = 90, P3 = 80, etc.
+                score = max(0, min(100, 110 - pos_int * 10))
+
+                metrics["final_position"] = {
+                    "label": "Final position",
+                    "value": f"P{pos_int}",
+                    "description": "Classified finishing position in this race.",
+                    "score": score,
+                    "impact": "positive" if pos_int <= 3 else "negative",
+                }
+        except (TypeError, ValueError):
+            pass
+
+    return metrics
+
+
 
 # -------- RACEMETA PROMPT --------
 
@@ -285,7 +349,7 @@ You are RaceMeta, an F1 pit-wall meta strategist. You explain race strategy call
 
 You ALWAYS answer in this format:
 
-Verdict: <2–5 words, strong opinion – e.g. "Optimal cover", "Costly overcut", "Mixed – defendable">
+Verdict: <2–8 words, strong opinion – e.g. "Optimal cover", "Costly overcut", "Mixed – defendable">
 Why:
 - Point 1 (max ~18 words, ONE clear idea)
 - Point 2
@@ -579,21 +643,21 @@ def analyze():
         race_context = extract_race_context_from_context_block(context_block, fallback_pit_lap=pit_lap)
 
         # Placeholder metrics – we will fill these from OpenF1 later
-        metrics = {}
+        metrics = compute_metrics_from_openf1(stints, pit_lap, driver_info)
 
-        return jsonify(
-            {
-                "context": context_block,
-                "verdict": verdict,
-                "summary": parsed["summary"],
-                "verdict_type": parsed["verdict_type"],
-                "reasoning": parsed["reasoning"],
-                "recommended_strategy": parsed["recommended_strategy"],
-                "race_context": race_context,
-                "metrics": metrics,
-                "confidence": 80,  # heuristic for now
-            }
-        )
+
+      return jsonify({
+    "context": context_block,
+    "verdict": verdict_text,
+    "summary": summary,
+    "verdict_type": verdict_type,
+    "reasoning": reasoning,
+    "recommended_strategy": recommended_strategy,
+    "confidence": confidence,
+    "race_context": race_context,
+    "metrics": metrics,
+})
+
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
