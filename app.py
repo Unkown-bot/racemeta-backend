@@ -253,6 +253,145 @@ def detect_lap_from_question(question: str):
             return None
     return None
 
+def parse_positions_from_question(question: str):
+    """
+    Try to detect start/end positions like 'P2 → P4' or 'P2 to P4' from the question.
+    Falls back to a single 'P5' if that's all we have.
+    """
+    q = question.upper()
+    # Pattern like P2 -> P4, P2 → P4, P2 to P4
+    m_range = re.search(r"P(\d+)\s*(?:→|->|to|-|–)\s*P(\d+)", q)
+    if m_range:
+        start = int(m_range.group(1))
+        end = int(m_range.group(2))
+        return start, end
+
+    # Single Pn mentioned
+    m_single = re.search(r"P(\d+)", q)
+    if m_single:
+        end = int(m_single.group(1))
+        return None, end
+
+    return None, None
+
+
+def compute_metrics_from_stints(stints, pit_lap: int, question: str):
+    """
+    Build the metrics dict that the frontend expects, using real stint data
+    and light heuristics from the question text.
+    """
+    metrics = {}
+
+    if not stints:
+        return metrics
+
+    stints_sorted = sorted(stints, key=lambda s: s["stint_number"])
+    current_stint = None
+    for stint in stints_sorted:
+        if stint["lap_start"] <= pit_lap <= stint["lap_end"]:
+            current_stint = stint
+            break
+    if current_stint is None:
+        current_stint = stints_sorted[0]
+
+    stint_start = current_stint["lap_start"]
+    stint_end = current_stint["lap_end"]
+    stint_len = stint_end - stint_start + 1
+    laps_used = pit_lap - stint_start + 1
+    laps_left = max(stint_end - pit_lap, 0)
+
+    # --- 1) Tyre life ---
+    # Score: more laps left = more conservative (= lower score from a "fully used" POV).
+    # We keep this fairly neutral in impact for now.
+    if stint_len > 0:
+        used_frac = laps_used / stint_len
+        # 0 = boxed immediately; 100 = ran full stint
+        tyre_life_score = int(max(0, min(100, used_frac * 100)))
+    else:
+        tyre_life_score = 50
+
+    metrics["tyre_life"] = {
+        "label": "Tyre life",
+        "value": f"{laps_left} laps",
+        "description": "Estimated usable life left in this stint when the stop was made.",
+        "score": tyre_life_score,
+        "impact": "neutral",
+    }
+
+    # --- 2) Undercut window (rough) ---
+    # Use the stint as a guide: call the "natural" window between 40–70% of stint length.
+    if stint_len >= 6:
+        win_start = stint_start + int(0.4 * stint_len)
+        win_end = stint_start + int(0.7 * stint_len)
+        metrics["undercut_window"] = {
+            "label": "Undercut window",
+            "value": f"Laps {win_start}-{win_end}",
+            "description": "Approximate first-stop window based on this stint’s length.",
+            "score": 60,
+            "impact": "neutral",
+        }
+
+    # --- 3) Track position & final position (from question text) ---
+    start_pos, end_pos = parse_positions_from_question(question)
+    if end_pos is not None:
+        metrics["final_position"] = {
+            "label": "Final position",
+            "value": f"P{end_pos}",
+            "description": "Finishing position based on your prompt.",
+            "score": max(0, 100 - (end_pos - 1) * 5),
+            "impact": "neutral",
+        }
+
+    if start_pos is not None and end_pos is not None:
+        delta = end_pos - start_pos
+        sign = "+" if delta > 0 else ""
+        metrics["track_position"] = {
+            "label": "Track position",
+            "value": f"{sign}{delta} places",
+            "description": "Places lost / gained across the pit cycle (from your prompt).",
+            "score": max(0, 100 - abs(delta) * 10),
+            "impact": "negative" if delta > 0 else ("positive" if delta < 0 else "neutral"),
+        }
+
+    # --- 4) Traffic cost & pace delta (heuristic, but consistent) ---
+    # Idea: if you pitted with lots of life left (conservative) AND you lost places,
+    # we assume extra time spent in traffic vs. clean air.
+    traffic_score = 50
+    pace_score = 50
+    impact_traffic = "neutral"
+    impact_pace = "neutral"
+
+    if laps_left >= 3 and start_pos is not None and end_pos is not None and end_pos > start_pos:
+        # Early stop + position loss -> likely traffic pain
+        traffic_score = 70
+        impact_traffic = "negative"
+        pace_score = 60
+        impact_pace = "positive"
+        traffic_value = "~3–6 sec"
+        pace_value = "+0.2–0.5s/lap"
+    else:
+        traffic_value = "Low"
+        pace_value = "Small"
+
+    metrics["traffic_cost"] = {
+        "label": "Traffic cost",
+        "value": traffic_value,
+        "description": "Rough estimate of time lost fighting cars vs. staying in clean air.",
+        "score": traffic_score,
+        "impact": impact_traffic,
+    }
+
+    metrics["pace_delta"] = {
+        "label": "Pace delta",
+        "value": pace_value,
+        "description": "Approximate post-stop pace advantage vs. rivals, inferred from the stint shape.",
+        "score": pace_score,
+        "impact": impact_pace,
+    }
+
+    return metrics
+
+
 
 def summarise_stints(stints, pit_lap: int):
     if not stints:
@@ -634,22 +773,27 @@ def analyze_latest_core(question: str):
 
     verdict_text = call_racemeta(context_block)
 
-    # 7) Parse verdict into structured fields
-    parsed = parse_racemeta_output(verdict_text)
-    race_context = build_race_context(session, driver_info, pit_lap)
-    metrics = compute_metrics_from_openf1(stints, pit_lap, driver_info)
+# 7) Parse verdict into structured fields
+parsed = parse_racemeta_output(verdict_text)
+race_context = build_race_context(session, driver_info, pit_lap)
 
-    return {
-        "context": context_block,
-        "verdict": verdict_text,
-        "summary": parsed["summary"],
-        "verdict_type": parsed["verdict_type"],
-        "reasoning": parsed["reasoning"],
-        "recommended_strategy": parsed["recommended_strategy"],
-        "confidence": parsed["confidence"],
-        "race_context": race_context,
-        "metrics": metrics,
-    }
+# ⬇️ REPLACE this existing line:
+# metrics = compute_metrics_from_openf1(stints, pit_lap, driver_info)
+
+# ⬆️ WITH this:
+metrics = compute_metrics_from_stints(stints, pit_lap, question)
+
+return {
+    "context": context_block,
+    "verdict": verdict_text,
+    "summary": parsed["summary"],
+    "verdict_type": parsed["verdict_type"],
+    "reasoning": parsed["reasoning"],
+    "recommended_strategy": parsed["recommended_strategy"],
+    "confidence": parsed["confidence"],
+    "race_context": race_context,
+    "metrics": metrics,
+}
 
 
 # -------- HTTP ENDPOINTS --------
