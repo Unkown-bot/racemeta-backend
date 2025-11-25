@@ -468,23 +468,29 @@ def parse_racemeta_output(verdict_raw: str):
 
     # Reasoning: lines under "Why:" starting with - or •
     reasoning = []
-    why_match = re.search(r"Why:\s*([^]*?)(?:Alt:|Take:|$)", text, re.IGNORECASE)
+    why_match = re.search(
+        r"Why:\s*(.*?)(?:Alt:|Take:|$)",
+        text,
+        re.IGNORECASE | re.DOTALL,
+    )
     if why_match:
         block = why_match.group(1)
         for line in block.splitlines():
             line = line.strip()
             if not line:
                 continue
-            if line.startswith("-"):
-                line = line[1:].strip()
-            if line.startswith("•"):
+            if line.startswith("-") or line.startswith("•"):
                 line = line[1:].strip()
             if line:
                 reasoning.append(line)
 
     # Recommended strategy from "Alt:"
     recommended_strategy = None
-    alt_match = re.search(r"Alt:\s*([^]*?)(?:Take:|$)", text, re.IGNORECASE)
+    alt_match = re.search(
+        r"Alt:\s*(.*?)(?:Take:|$)",
+        text,
+        re.IGNORECASE | re.DOTALL,
+    )
     if alt_match:
         recommended_strategy = alt_match.group(1).strip()
 
@@ -498,6 +504,7 @@ def parse_racemeta_output(verdict_raw: str):
         "verdict_type": verdict_type,
         "confidence": confidence,
     }
+
 
 
 def build_race_context(session, driver_info, pit_lap: int):
