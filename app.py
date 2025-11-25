@@ -276,6 +276,7 @@ def summarise_stints(stints, pit_lap: int):
 
     return "\n".join(lines), before_comp, after_comp
 
+
 def compute_metrics_from_openf1(stints, pit_lap: int, driver_info):
     """
     Build a small metrics dict using only real OpenF1 data.
@@ -296,9 +297,10 @@ def compute_metrics_from_openf1(stints, pit_lap: int, driver_info):
                 laps_used = pit_lap - ls + 1
                 laps_remaining = max(0, le - pit_lap)
 
-                # Normalised 0–100 score for the progress bar
                 if stint_len > 0:
-                    life_score = int(max(0, min(100, (laps_remaining / stint_len) * 100)))
+                    life_score = int(
+                        max(0, min(100, (laps_remaining / stint_len) * 100))
+                    )
                 else:
                     life_score = 0
 
@@ -307,14 +309,12 @@ def compute_metrics_from_openf1(stints, pit_lap: int, driver_info):
                     "value": f"{laps_remaining} laps",
                     "description": "Estimated usable life left in this stint when the stop was made.",
                     "score": life_score,
-                    # If you still had a decent margin, that’s generally positive
                     "impact": "positive" if laps_remaining >= 3 else "neutral",
                 }
                 break
 
     # --- Final position ---
     if driver_info:
-        # Different OpenF1 dumps sometimes call this 'position' or similar
         finishing_pos = (
             driver_info.get("position")
             or driver_info.get("position_over_line")
@@ -340,7 +340,6 @@ def compute_metrics_from_openf1(stints, pit_lap: int, driver_info):
     return metrics
 
 
-
 # -------- RACEMETA PROMPT --------
 
 RACEMETA_SYSTEM_PROMPT = """
@@ -349,7 +348,7 @@ You are RaceMeta, an F1 pit-wall meta strategist. You explain race strategy call
 
 You ALWAYS answer in this format:
 
-Verdict: <2–8 words, strong opinion – e.g. "Optimal cover", "Costly overcut", "Mixed – defendable">
+Verdict: 2–8 words, strong opinion – e.g. "Optimal cover", "Costly overcut", "Mixed – defendable">
 Why:
 - Point 1 (max ~18 words, ONE clear idea)
 - Point 2
@@ -375,7 +374,7 @@ Why:
 Alt: Ask the user for 1–2 specific details.
 Take: Clear inputs = sharper strategy calls.
 
-Never add anything outside this template.
+
 """
 
 
@@ -441,129 +440,100 @@ def call_racemeta(context_block: str) -> str:
     return completion.choices[0].message.content.strip()
 
 
-# -------- NEW HELPERS: PARSE & RACE CONTEXT --------
-
-
-def classify_verdict_type(text: str) -> str:
-    """
-    Map summary/verdict text into 'optimal', 'suboptimal' or 'neutral'.
-    """
+def classify_verdict_text(text: str) -> str:
     t = (text or "").lower()
-    if any(x in t for x in ["suboptimal", "too early", "too late", "costly", "bad call"]):
+    if "suboptimal" in t or "too early" in t or "too late" in t or "costly" in t:
         return "suboptimal"
-    if any(x in t for x in ["optimal", "good call", "right call", "smart", "strong"]):
+    if "optimal" in t or "great call" in t or "right call" in t or "good call" in t:
         return "optimal"
     if "need more info" in t:
         return "neutral"
     return "neutral"
 
 
-def parse_racemeta_verdict(verdict_text: str):
+def parse_racemeta_output(verdict_raw: str):
     """
-    Parse the formatted RaceMeta answer into structured pieces:
-    summary, verdict_type, reasoning list, recommended_strategy.
+    Take the full template text from RaceMeta and extract:
+    - one-line summary
+    - reasoning bullets
+    - recommended strategy
     """
-    if not verdict_text:
-        return {
-            "summary": "",
-            "verdict_type": "neutral",
-            "reasoning": [],
-            "recommended_strategy": "",
-        }
+    text = verdict_raw or ""
 
-    text = verdict_text.strip()
+    # Extract the verdict line after "Verdict:"
+    summary = text
+    m = re.search(r"Verdict:\s*(.+)", text)
+    if m:
+        summary = m.group(1).strip()
 
-    # Summary = line after "Verdict:"
-    summary = ""
-    m_verdict = re.search(r"Verdict:\s*(.*)", text, re.IGNORECASE)
-    if m_verdict:
-        summary = m_verdict.group(1).strip()
-
-    # Why-section (between "Why:" and the next "Alt:" or "Take:" line or end)
+    # Reasoning: lines under "Why:" starting with - or •
     reasoning = []
-    m_why = re.search(
-        r"Why:\s*([\s\S]*?)(?:\nAlt:|\nTake:|$)",
-        text,
-        re.IGNORECASE,
-    )
-    if m_why:
-        why_part = m_why.group(1)
-        for line in why_part.splitlines():
-            l = line.strip()
-            if not l:
+    why_match = re.search(r"Why:\s*([^]*?)(?:Alt:|Take:|$)", text, re.IGNORECASE)
+    if why_match:
+        block = why_match.group(1)
+        for line in block.splitlines():
+            line = line.strip()
+            if not line:
                 continue
-            # Strip leading "- " or "• "
-            l = re.sub(r"^[-•]\s*", "", l)
-            if l:
-                reasoning.append(l)
+            if line.startswith("-"):
+                line = line[1:].strip()
+            if line.startswith("•"):
+                line = line[1:].strip()
+            if line:
+                reasoning.append(line)
 
-    # Alt: recommended_strategy (between "Alt:" and "Take:" or end)
-    recommended_strategy = ""
-    m_alt = re.search(
-        r"Alt:\s*([\s\S]*?)(?:\nTake:|$)",
-        text,
-        re.IGNORECASE,
-    )
-    if m_alt:
-        recommended_strategy = m_alt.group(1).strip()
+    # Recommended strategy from "Alt:"
+    recommended_strategy = None
+    alt_match = re.search(r"Alt:\s*([^]*?)(?:Take:|$)", text, re.IGNORECASE)
+    if alt_match:
+        recommended_strategy = alt_match.group(1).strip()
 
-    verdict_type = classify_verdict_type(summary or verdict_text)
+    verdict_type = classify_verdict_text(text)
+    confidence = 80  # default; we can tune later if we want
 
     return {
-        "summary": summary or verdict_text,
-        "verdict_type": verdict_type,
+        "summary": summary,
         "reasoning": reasoning,
         "recommended_strategy": recommended_strategy,
+        "verdict_type": verdict_type,
+        "confidence": confidence,
     }
 
 
+def build_race_context(session, driver_info, pit_lap: int):
+    track_name = (
+        session.get("circuit_short_name")
+        or session.get("location")
+        or "Unknown circuit"
+    )
+    country = session.get("country_name", "Unknown country")
+    year = session.get("year", "Unknown year")
+    race_label = f"{country} {year} ({track_name})"
 
-def extract_race_context_from_context_block(context_block: str, fallback_pit_lap=None):
-    """
-    Parse 'Race:' and 'Driver:' lines + pit lap from the text context block.
-    This lets us build a race_context object for the frontend.
-    """
-    driver = None
-    race = None
-    lap = None
+    driver_name = driver_info.get("full_name") if driver_info else "Unknown driver"
 
-    # Race: Country Year (Track)
-    m_race = re.search(r"^Race:\s*(.+)$", context_block, re.IGNORECASE | re.MULTILINE)
-    if m_race:
-        race = m_race.group(1).strip()
-
-    # Driver: Name
-    m_driver = re.search(r"^Driver:\s*(.+)$", context_block, re.IGNORECASE | re.MULTILINE)
-    if m_driver:
-        driver = m_driver.group(1).strip()
-
-    # Pit of interest: lap N
-    m_lap = re.search(r"Pit of interest:\s*lap\s+(\d+)", context_block, re.IGNORECASE)
-    if m_lap:
-        try:
-            lap = int(m_lap.group(1))
-        except ValueError:
-            lap = None
-
-    if lap is None and fallback_pit_lap is not None:
-        lap = fallback_pit_lap
-
-    # Build label
-    label_parts = []
-    if driver:
-        label_parts.append(driver)
-    if race:
-        label_parts.append(race)
-    if lap is not None:
-        label_parts.append(f"lap {lap}")
-    label = " – ".join(label_parts) if label_parts else "Race context"
+    # Some OpenF1 dumps have position-like fields
+    finishing_pos = (
+        driver_info.get("position")
+        or driver_info.get("position_over_line")
+        or driver_info.get("classification_position")
+        if driver_info
+        else None
+    )
+    try:
+        if finishing_pos is not None:
+            pos_str = f"P{int(finishing_pos)}"
+        else:
+            pos_str = None
+    except (TypeError, ValueError):
+        pos_str = None
 
     return {
-        "driver": driver or "Unknown driver",
-        "race": race or "Unknown race",
-        "lap": lap,
-        "position": None,  # we can wire this later from OpenF1 laps data
-        "label": label,
+        "driver": driver_name,
+        "race": race_label,
+        "lap": pit_lap,
+        "position": pos_str,
+        "label": f"{driver_name} – {race_label} – lap {pit_lap}",
     }
 
 
@@ -597,76 +567,18 @@ def threads_post_text_reply(text: str, reply_to_id: str):
         return None
 
 
-# -------- HTTP ENDPOINTS --------
-
-
-@app.route("/analyze", methods=["POST"])
-def analyze():
-    """
-    Structured endpoint for a specific race/driver/lap.
-    Kept mostly for completeness; your playground currently uses /analyze_latest.
-    """
-    try:
-        data = request.get_json(force=True)
-        year = int(data["year"])
-        country = str(data["country"])
-        driver_number = int(data["driver_number"])
-        pit_lap = int(data["pit_lap"])
-        question = str(data["question"])
-    except Exception as e:
-        return jsonify({"error": f"Invalid payload: {e}"}), 400
-
-    try:
-        session = get_race_session(year, country)
-        session_key = session["session_key"]
-        meeting_key = session["meeting_key"]
-
-        driver_info = get_driver_info(session_key, driver_number)
-        stints = get_stints(session_key, driver_number)
-        stint_text, before_comp, after_comp = summarise_stints(stints, pit_lap)
-        weather = get_weather(meeting_key)
-
-        context_block = build_context_block(
-            session=session,
-            driver_info=driver_info,
-            weather=weather,
-            stint_text=stint_text,
-            before_comp=before_comp,
-            after_comp=after_comp,
-            pit_lap=pit_lap,
-            user_question=question,
-        )
-
-        verdict = call_racemeta(context_block)
-
-        parsed = parse_racemeta_verdict(verdict)
-        race_context = extract_race_context_from_context_block(context_block, fallback_pit_lap=pit_lap)
-
-        # Placeholder metrics – we will fill these from OpenF1 later
-        metrics = compute_metrics_from_openf1(stints, pit_lap, driver_info)
-
-
-      return jsonify({
-    "context": context_block,
-    "verdict": verdict_text,
-    "summary": summary,
-    "verdict_type": verdict_type,
-    "reasoning": reasoning,
-    "recommended_strategy": recommended_strategy,
-    "confidence": confidence,
-    "race_context": race_context,
-    "metrics": metrics,
-})
-
-
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+# -------- CORE ANALYSIS LOGIC --------
 
 
 def analyze_latest_core(question: str):
     """
     Core logic for 'latest race' natural-language analysis.
-    Returns (context_block, verdict).
+    Returns a structured dict including:
+    - context_block (string)
+    - verdict (string)
+    - summary, verdict_type, reasoning, recommended_strategy, confidence
+    - race_context (dict)
+    - metrics (dict)
     """
     # 1) Choose race session based on question (track-aware)
     session = choose_session_for_question(question)
@@ -713,23 +625,98 @@ def analyze_latest_core(question: str):
         user_question=question,
     )
 
-    verdict = call_racemeta(context_block)
+    verdict_text = call_racemeta(context_block)
 
-    return context_block, verdict
+    # 7) Parse verdict into structured fields
+    parsed = parse_racemeta_output(verdict_text)
+    race_context = build_race_context(session, driver_info, pit_lap)
+    metrics = compute_metrics_from_openf1(stints, pit_lap, driver_info)
+
+    return {
+        "context": context_block,
+        "verdict": verdict_text,
+        "summary": parsed["summary"],
+        "verdict_type": parsed["verdict_type"],
+        "reasoning": parsed["reasoning"],
+        "recommended_strategy": parsed["recommended_strategy"],
+        "confidence": parsed["confidence"],
+        "race_context": race_context,
+        "metrics": metrics,
+    }
+
+
+# -------- HTTP ENDPOINTS --------
+
+
+@app.route("/analyze", methods=["POST"])
+def analyze():
+    """
+    Structured endpoint where caller passes explicit year, country, driver_number, pit_lap.
+    Kept simpler; returns the same structured JSON as analyze_latest.
+    """
+    try:
+        data = request.get_json(force=True)
+        year = int(data["year"])
+        country = str(data["country"])
+        driver_number = int(data["driver_number"])
+        pit_lap = int(data["pit_lap"])
+        question = str(data["question"])
+    except Exception as e:
+        return jsonify({"error": f"Invalid payload: {e}"}), 400
+
+    try:
+        session = get_race_session(year, country)
+        session_key = session["session_key"]
+        meeting_key = session["meeting_key"]
+
+        driver_info = get_driver_info(session_key, driver_number)
+        stints = get_stints(session_key, driver_number)
+        stint_text, before_comp, after_comp = summarise_stints(stints, pit_lap)
+        weather = get_weather(meeting_key)
+
+        context_block = build_context_block(
+            session=session,
+            driver_info=driver_info,
+            weather=weather,
+            stint_text=stint_text,
+            before_comp=before_comp,
+            after_comp=after_comp,
+            pit_lap=pit_lap,
+            user_question=question,
+        )
+
+        verdict_text = call_racemeta(context_block)
+        parsed = parse_racemeta_output(verdict_text)
+        race_context = build_race_context(session, driver_info, pit_lap)
+        metrics = compute_metrics_from_openf1(stints, pit_lap, driver_info)
+
+        return jsonify(
+            {
+                "context": context_block,
+                "verdict": verdict_text,
+                "summary": parsed["summary"],
+                "verdict_type": parsed["verdict_type"],
+                "reasoning": parsed["reasoning"],
+                "recommended_strategy": parsed["recommended_strategy"],
+                "confidence": parsed["confidence"],
+                "race_context": race_context,
+                "metrics": metrics,
+            }
+        )
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route("/analyze_latest", methods=["POST"])
 def analyze_latest():
     """
-    Natural-language endpoint used by the playground.
+    Natural-language endpoint.
 
     Expects JSON:
     {
       "question": "Was it right to pit Lewis or extend his stint?"
     }
-
-    Returns both legacy fields (context, verdict) and structured fields
-    (summary, verdict_type, reasoning, recommended_strategy, race_context, metrics, confidence).
     """
     try:
         data = request.get_json(force=True)
@@ -738,27 +725,8 @@ def analyze_latest():
         return jsonify({"error": f"Invalid payload: {e}"}), 400
 
     try:
-        context_block, verdict = analyze_latest_core(question)
-
-        parsed = parse_racemeta_verdict(verdict)
-        race_context = extract_race_context_from_context_block(context_block)
-
-        metrics = {}
-
-        return jsonify(
-            {
-                "context": context_block,
-                "verdict": verdict,
-                "summary": parsed["summary"],
-                "verdict_type": parsed["verdict_type"],
-                "reasoning": parsed["reasoning"],
-                "recommended_strategy": parsed["recommended_strategy"],
-                "race_context": race_context,
-                "metrics": metrics,
-                "confidence": 80,
-            }
-        )
-
+        result = analyze_latest_core(question)
+        return jsonify(result)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -807,7 +775,8 @@ def threads_webhook():
                     continue
 
                 try:
-                    _, verdict = analyze_latest_core(question)
+                    core = analyze_latest_core(question)
+                    verdict = core.get("verdict", "")
                     threads_post_text_reply(verdict, reply_to_id=str(media_id))
                 except Exception as e:
                     print("Error handling mention:", e)
@@ -827,5 +796,3 @@ def health():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     app.run(host="0.0.0.0", port=port)
-
-
